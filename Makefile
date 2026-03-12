@@ -89,6 +89,7 @@ ps: dirs common $(DIST)/ps.o
 triage_bof: dirs common $(DIST)/triage_bof.o
 search: dirs common $(DIST)/search.o
 sccm: dirs common $(DIST)/sccm.o
+sccm_disk: dirs common $(DIST)/sccm_disk.o
 machinemasterkeys: dirs common $(DIST)/machinemasterkeys.o
 machinecredentials: dirs common $(DIST)/machinecredentials.o
 machinevaults: dirs common $(DIST)/machinevaults.o

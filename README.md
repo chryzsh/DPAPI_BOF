@@ -266,10 +266,17 @@ ps /target:FILE [/pvk:BASE64] [/password:PASS] [/ntlm:HASH]
 ```
 
 #### `sccm`
-Extract SCCM Network Access Account (NAA) and task sequence credentials. Requires admin.
+Extract live SCCM Network Access Account (NAA) credentials via WMI (CRED-3). Requires admin.
 
 ```
-sccm [/target:PATH]
+sccm
+```
+
+#### `sccm_disk`
+Extract SCCM Network Access Account (NAA) credentials from `OBJECTS.DATA` on disk (CRED-4). Requires admin.
+
+```
+sccm_disk [/target:PATH]
 ```
 
 **Examples:**
@@ -283,8 +290,11 @@ keepass /pvk:AQAAAA...
 # PowerShell PSCredential
 ps /target:C:\Users\admin\cred.xml /unprotect
 
-# SCCM NAA creds (run as SYSTEM)
+# SCCM CRED-3 NAA creds (run as SYSTEM)
 sccm
+
+# SCCM CRED-4 NAA creds from disk
+sccm_disk /target:C:\Windows\System32\wbem\Repository\OBJECTS.DATA
 ```
 
 ---

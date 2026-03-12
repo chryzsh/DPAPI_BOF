@@ -1221,7 +1221,19 @@ BOOL triage_sccm_wmi(void) {
 
     hr = IWbemLocator_ConnectServer(locator, ns, NULL, NULL, NULL, 0, NULL, NULL, &services);
     if (FAILED(hr) || !services) {
-        BeaconPrintf(CALLBACK_ERROR, "[!] IWbemLocator::ConnectServer failed: 0x%08lx\n", hr);
+        if (hr == (HRESULT)0x8004100e) {
+            BeaconPrintf(CALLBACK_ERROR,
+                         "[!] SCCM WMI namespace %S does not exist on this host (0x%08lx)\n",
+                         namespace_path, hr);
+            BeaconPrintf(CALLBACK_OUTPUT,
+                         "[*] CRED-3 requires a live SCCM client policy namespace\n");
+            BeaconPrintf(CALLBACK_OUTPUT,
+                         "[*] This usually means the host is not an active SCCM client, or the live policy namespace is unavailable\n");
+            BeaconPrintf(CALLBACK_OUTPUT,
+                         "[*] Try the disk/CRED-4 path against OBJECTS.DATA instead\n");
+        } else {
+            BeaconPrintf(CALLBACK_ERROR, "[!] IWbemLocator::ConnectServer failed: 0x%08lx\n", hr);
+        }
         goto cleanup;
     }
 
@@ -1338,7 +1350,7 @@ cleanup:
     return result;
 }
 
-BOOL triage_sccm(MASTERKEY_CACHE* cache, const wchar_t* target) {
+BOOL triage_sccm_disk(MASTERKEY_CACHE* cache, const wchar_t* target) {
 
     const wchar_t* objects_path = target;
     wchar_t default_path[] = L"C:\\Windows\\System32\\wbem\\Repository\\OBJECTS.DATA";
