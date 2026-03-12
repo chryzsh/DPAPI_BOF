@@ -84,6 +84,7 @@ void     mk_cache_print(MASTERKEY_CACHE* cache);
 typedef struct _DPAPI_BLOB {
     DWORD version;
     GUID  provider;
+    DWORD masterkey_version;
     GUID  masterkey_guid;
     DWORD flags;
     DWORD description_len;

@@ -538,57 +538,78 @@ BOOL decrypt_triple_des_hmac(const BYTE* key, int key_len,
 /* ---- DPAPI blob decrypt ----
  * Matches SharpDPAPI Crypto.DecryptBlob() */
 BOOL decrypt_blob(const BYTE* encrypted, int enc_len,
+                  const BYTE* salt, int salt_len,
                   const BYTE* key, int key_len,
                   DWORD alg_crypt, DWORD alg_hash,
                   BYTE** decrypted, int* dec_len) {
-    int enc_key_len, iv_len;
-
-    /* Determine key/IV sizes based on algorithm */
-    switch (alg_crypt) {
-        case CALG_3DES:
-        case CALG_3DES_112:
-            enc_key_len = 24;
-            iv_len = 8;
-            break;
-        case CALG_AES_256:
-            enc_key_len = 32;
-            iv_len = 16;
-            break;
-        case CALG_AES_128:
-            enc_key_len = 16;
-            iv_len = 16;
-            break;
-        case CALG_AES_192:
-            enc_key_len = 24;
-            iv_len = 16;
-            break;
-        default:
-            return FALSE;
-    }
-
-    /* Derive the encryption key from the masterkey */
-    BYTE derived_key[64];
-    if (!derive_key(key, key_len, alg_hash, derived_key, enc_key_len + iv_len))
+    if (!encrypted || enc_len <= 0 || !salt || salt_len <= 0 || !key || key_len <= 0 ||
+        !decrypted || !dec_len) {
         return FALSE;
-
-    /* Split into enc_key and iv */
-    BYTE* enc_key = derived_key;
-    BYTE* iv = derived_key + enc_key_len;
-
-    /* Decrypt */
-    switch (alg_crypt) {
-        case CALG_3DES:
-        case CALG_3DES_112:
-            return triple_des_decrypt(enc_key, enc_key_len, iv, iv_len,
-                                      encrypted, enc_len, decrypted, dec_len);
-        case CALG_AES_256:
-        case CALG_AES_192:
-        case CALG_AES_128:
-            return aes_decrypt(enc_key, enc_key_len, iv, iv_len,
-                               encrypted, enc_len, decrypted, dec_len);
-        default:
-            return FALSE;
     }
+
+    *decrypted = NULL;
+    *dec_len = 0;
+
+    if (alg_crypt == CALG_AES_256 && alg_hash == CALG_SHA_512) {
+        BYTE session_key[64];
+        BYTE iv[16];
+        memset(iv, 0, sizeof(iv));
+
+        if (!hmac_sha512(key, key_len, salt, salt_len, session_key))
+            return FALSE;
+
+        return aes_decrypt(session_key, 32, iv, sizeof(iv),
+                           encrypted, enc_len, decrypted, dec_len);
+    }
+
+    if ((alg_crypt == CALG_3DES || alg_crypt == CALG_3DES_112) &&
+        alg_hash == CALG_SHA1) {
+        BYTE ipad[64], opad[64], sha1_inner[20], sha1_outer[20], derived_raw[40];
+        BYTE iv[8];
+        memset(iv, 0, sizeof(iv));
+        memset(ipad, 0x36, sizeof(ipad));
+        memset(opad, 0x5C, sizeof(opad));
+
+        for (int i = 0; i < key_len && i < 64; i++) {
+            ipad[i] ^= key[i];
+            opad[i] ^= key[i];
+        }
+
+        BYTE* buffer_i = (BYTE*)intAlloc(64 + salt_len);
+        BYTE* buffer_o = (BYTE*)intAlloc(64 + 20);
+        if (!buffer_i || !buffer_o) {
+            if (buffer_i) intFree(buffer_i);
+            if (buffer_o) intFree(buffer_o);
+            return FALSE;
+        }
+
+        memcpy(buffer_i, ipad, 64);
+        memcpy(buffer_i + 64, salt, salt_len);
+        if (!sha1_hash(buffer_i, 64 + salt_len, sha1_inner)) {
+            intFree(buffer_i);
+            intFree(buffer_o);
+            return FALSE;
+        }
+
+        memcpy(buffer_o, opad, 64);
+        memcpy(buffer_o + 64, sha1_inner, 20);
+        if (!sha1_hash(buffer_o, 84, sha1_outer)) {
+            intFree(buffer_i);
+            intFree(buffer_o);
+            return FALSE;
+        }
+
+        intFree(buffer_i);
+        intFree(buffer_o);
+
+        if (!derive_key_raw(sha1_outer, 20, CALG_SHA1, derived_raw, sizeof(derived_raw)))
+            return FALSE;
+
+        return triple_des_decrypt(derived_raw, 24, derived_raw + 24, 8,
+                                  encrypted, enc_len, decrypted, dec_len);
+    }
+
+    return FALSE;
 }
 
 /* ---- HMAC verification ---- */

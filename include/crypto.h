@@ -12,6 +12,7 @@ BOOL kerberos_password_hash(DWORD etype, const wchar_t* password, const wchar_t*
 
 /* ---- DPAPI blob decryption ---- */
 BOOL decrypt_blob(const BYTE* encrypted, int enc_len,
+                  const BYTE* salt, int salt_len,
                   const BYTE* key, int key_len,
                   DWORD alg_crypt, DWORD alg_hash,
                   BYTE** decrypted, int* dec_len);

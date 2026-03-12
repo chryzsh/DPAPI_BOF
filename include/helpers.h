@@ -22,6 +22,7 @@ void str_to_lower(char* str);
 
 /* ---- Path / system helpers ---- */
 BOOL is_high_integrity(void);
+BOOL is_system(void);
 BOOL get_system(void);
 BOOL revert_to_self_helper(void);
 wchar_t** get_user_folders(int* count);

