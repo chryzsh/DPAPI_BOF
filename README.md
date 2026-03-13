@@ -1,13 +1,32 @@
 # DPAPI_BOF
 
-**SharpDPAPI** ported to **Cobalt Strike Beacon Object Files (BOFs)** - 19 self-contained BOFs for DPAPI credential triage, all under 52KB each.
+**SharpDPAPI** ported to **Cobalt Strike Beacon Object Files (BOFs)** - 20 self-contained BOFs for DPAPI credential triage.
 
 > Full port of [GhostPack/SharpDPAPI](https://github.com/GhostPack/SharpDPAPI) - including MS-BKRP RPC masterkey decryption, Chrome/Edge/Brave credential extraction, and machine-level DPAPI triage.
+
+## Fork Status
+
+This fork adds SCCM-specific attack paths that are not present in upstream in the same form. These notes describe the current behavior of this fork, not upstream `DPAPI_BOF`.
+
+### SCCM Attack Coverage
+
+| BOF | Attack | Status | What it does | What it does not do |
+|-----|--------|--------|--------------|---------------------|
+| `sccm.o` | CRED-3 | Implemented and validated on a real SCCM client | Queries `ROOT\ccm\policy\Machine\ActualConfig`, reads `CCM_NetworkAccessAccount`, impersonates `SYSTEM` if needed, and decrypts current NAA credentials locally with `CryptUnprotectData` | Does not retrieve task sequences, collection variables, or perform remote WMI collection |
+| `sccm_disk.o` | CRED-4 | Implemented and validated for local NAA recovery from `OBJECTS.DATA` | Reads `C:\Windows\System32\wbem\Repository\OBJECTS.DATA`, extracts legacy/current `CCM_NetworkAccessAccount` secrets, impersonates `SYSTEM` if needed, and decrypts NAA credentials locally with `CryptUnprotectData` | Does not yet classify or decrypt task sequences, collection variables, or generic `other secrets` such as compressed `PolicyXML` blobs |
+
+### SCCM Notes
+
+- `sccm.o` is the live-policy BOF. It is the command to use for current SCCM NAA recovery on an active client.
+- `sccm_disk.o` is the disk/CIM-repository BOF. It is the command to use for legacy or on-disk NAA recovery from `OBJECTS.DATA`.
+- The older manual `DPAPI_SYSTEM -> masterkey -> blob` path is still present in shared code, but the working SCCM BOFs do not rely on it. SCCM decryption in this fork uses local DPAPI unprotect as `SYSTEM`.
+- Current SCCM validation covers local NAA recovery only. If you need task sequences, collection variables, or generic `PolicySecret` classification, treat those as unfinished work.
 
 ---
 
 ## Table of Contents
 
+- [Fork Status](#fork-status)
 - [Why BOFs?](#why-bofs)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -32,7 +51,7 @@
 | | SharpDPAPI (.NET) | DPAPI_BOF |
 |---|---|---|
 | **Execution** | Fork & run - spawns a sacrificial process | Inline execution - runs in beacon's own thread |
-| **Size** | ~600KB managed assembly | ~50KB per BOF |
+| **Size** | ~600KB managed assembly | ~40-65KB per BOF |
 | **Detection** | .NET CLR load + Assembly.Load detections | No CLR, no managed code, no child process |
 | **Dependencies** | Requires .NET on target | Zero dependencies - DFR resolves APIs at runtime |
 | **OPSEC** | Moderate - triggers ETW/.NET logs | High - no fork, no injection, minimal footprint |
@@ -65,6 +84,7 @@ SharpDPAPI-BOF/
 ├── ps.o
 ├── rdg.o
 ├── sccm.o
+├── sccm_disk.o
 ├── search.o
 ├── triage_bof.o
 └── vaults.o
@@ -82,7 +102,7 @@ See [Building from Source](#building-from-source) below.
 
 ### Verifying Installation
 
-After loading the CNA, type `help` in a beacon console. You should see all 19 commands registered:
+After loading the CNA, type `help` in a beacon console. You should see all 20 commands registered:
 
 ```
 beacon> help masterkeys
@@ -603,17 +623,27 @@ DPAPI_BOF/
 │   │   ├── lsadump.c          # LSA secret / DPAPI_SYSTEM extraction
 │   │   └── triage.c           # Masterkey/credential/vault file triage
 │   │
-│   └── bofs/                  # Individual BOF entry points (19 total)
-│       ├── masterkeys.c       ├── certificates.c
-│       ├── credentials.c      ├── rdg.c
-│       ├── vaults.c           ├── keepass.c
-│       ├── blob.c             ├── ps.c
-│       ├── backupkey.c        ├── search.c
-│       ├── triage_bof.c       ├── sccm.c
-│       ├── machinemasterkeys.c├── chrome_logins.c
-│       ├── machinecredentials.c├── chrome_cookies.c
-│       ├── machinevaults.c    └── chrome_statekeys.c
-│       └── machinetriage.c
+│   └── bofs/                  # Individual BOF entry points (20 total)
+│       ├── backupkey.c
+│       ├── blob.c
+│       ├── certificates.c
+│       ├── chrome_cookies.c
+│       ├── chrome_logins.c
+│       ├── chrome_statekeys.c
+│       ├── credentials.c
+│       ├── keepass.c
+│       ├── machinecredentials.c
+│       ├── machinemasterkeys.c
+│       ├── machinetriage.c
+│       ├── machinevaults.c
+│       ├── masterkeys.c
+│       ├── ps.c
+│       ├── rdg.c
+│       ├── sccm.c
+│       ├── sccm_disk.c
+│       ├── search.c
+│       ├── triage_bof.c
+│       └── vaults.c
 │
 ├── dist/                      # Compiled .o files (after make)
 └── .github/workflows/
