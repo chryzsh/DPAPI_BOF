@@ -408,6 +408,24 @@ beacon_command_register(
     "Usage: sccm_disk [/target:PATH]"
 );
 
+alias sccm_recon {
+    local('%args $data $bid');
+    $bid = $1;
+    %args = _parse_args(substr($0, 11));
+
+    $data = _load_bof("sccm_recon");
+    $args = bof_pack($bid, "z",
+        ""
+    );
+    beacon_inline_execute($bid, $data, "go", $args);
+}
+
+beacon_command_register(
+    "sccm_recon",
+    "Enumerate local SCCM files, logs, and ManagementPoints (RECON-7)",
+    "Usage: sccm_recon"
+);
+
 # ============================================================
 # Chrome BOFs
 # ============================================================

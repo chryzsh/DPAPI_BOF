@@ -124,6 +124,7 @@ BOOL triage_search(MASTERKEY_CACHE* cache,
                    const wchar_t* server,
                    const char* pattern);
 
+BOOL triage_sccm_recon(void);
 BOOL triage_sccm_wmi(void);
 BOOL triage_sccm_disk(MASTERKEY_CACHE* cache,
                       const wchar_t* target);

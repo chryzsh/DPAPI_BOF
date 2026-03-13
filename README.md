@@ -1,6 +1,6 @@
 # DPAPI_BOF
 
-**SharpDPAPI** ported to **Cobalt Strike Beacon Object Files (BOFs)** - 20 self-contained BOFs for DPAPI credential triage.
+**SharpDPAPI** ported to **Cobalt Strike Beacon Object Files (BOFs)** - 21 self-contained BOFs for DPAPI credential triage.
 
 > Full port of [GhostPack/SharpDPAPI](https://github.com/GhostPack/SharpDPAPI) - including MS-BKRP RPC masterkey decryption, Chrome/Edge/Brave credential extraction, and machine-level DPAPI triage.
 
@@ -12,6 +12,7 @@ This fork adds SCCM-specific attack paths that are not present in upstream in th
 
 | BOF | Attack | Status | What it does | What it does not do |
 |-----|--------|--------|--------------|---------------------|
+| `sccm_recon.o` | RECON-7 | Implemented in this fork, build/lint validated | Enumerates local SCCM directories, lists client cache contents, scrapes `C:\Windows\CCM\Logs` for candidate UNC paths and URLs, and reads the local `ManagementPoints` registry value when present | Not yet runtime-validated in-session; does not perform remote enumeration or LDAP/WMI site profiling |
 | `sccm.o` | CRED-3 | Implemented and validated on a real SCCM client | Queries `ROOT\ccm\policy\Machine\ActualConfig`, reads `CCM_NetworkAccessAccount`, impersonates `SYSTEM` if needed, and decrypts current NAA credentials locally with `CryptUnprotectData` | Does not retrieve task sequences, collection variables, or perform remote WMI collection |
 | `sccm_disk.o` | CRED-4 | Implemented and validated for local NAA recovery from `OBJECTS.DATA` | Reads `C:\Windows\System32\wbem\Repository\OBJECTS.DATA`, extracts legacy/current `CCM_NetworkAccessAccount` secrets, impersonates `SYSTEM` if needed, and decrypts NAA credentials locally with `CryptUnprotectData` | Does not yet classify or decrypt task sequences, collection variables, or generic `other secrets` such as compressed `PolicyXML` blobs |
 
@@ -19,8 +20,9 @@ This fork adds SCCM-specific attack paths that are not present in upstream in th
 
 - `sccm.o` is the live-policy BOF. It is the command to use for current SCCM NAA recovery on an active client.
 - `sccm_disk.o` is the disk/CIM-repository BOF. It is the command to use for legacy or on-disk NAA recovery from `OBJECTS.DATA`.
+- `sccm_recon.o` is the local file/registry enumeration BOF for RECON-7.
 - The older manual `DPAPI_SYSTEM -> masterkey -> blob` path is still present in shared code, but the working SCCM BOFs do not rely on it. SCCM decryption in this fork uses local DPAPI unprotect as `SYSTEM`.
-- Current SCCM validation covers local NAA recovery only. If you need task sequences, collection variables, or generic `PolicySecret` classification, treat those as unfinished work.
+- Current SCCM runtime validation covers local NAA recovery only. `sccm_recon.o` is implemented and build-tested, but not yet runtime-validated in this fork.
 
 ---
 
@@ -85,6 +87,7 @@ SharpDPAPI-BOF/
 ├── rdg.o
 ├── sccm.o
 ├── sccm_disk.o
+├── sccm_recon.o
 ├── search.o
 ├── triage_bof.o
 └── vaults.o
@@ -102,7 +105,7 @@ See [Building from Source](#building-from-source) below.
 
 ### Verifying Installation
 
-After loading the CNA, type `help` in a beacon console. You should see all 20 commands registered:
+After loading the CNA, type `help` in a beacon console. You should see all 21 commands registered:
 
 ```
 beacon> help masterkeys
@@ -299,6 +302,13 @@ Extract SCCM Network Access Account (NAA) credentials from `OBJECTS.DATA` on dis
 sccm_disk [/target:PATH]
 ```
 
+#### `sccm_recon`
+Enumerate local SCCM client files, logs, and `ManagementPoints` registry data (RECON-7).
+
+```
+sccm_recon
+```
+
 **Examples:**
 ```bash
 # RDCMan passwords
@@ -315,6 +325,9 @@ sccm
 
 # SCCM CRED-4 NAA creds from disk
 sccm_disk /target:C:\Windows\System32\wbem\Repository\OBJECTS.DATA
+
+# SCCM RECON-7 local file and log enumeration
+sccm_recon
 ```
 
 ---
@@ -623,7 +636,7 @@ DPAPI_BOF/
 │   │   ├── lsadump.c          # LSA secret / DPAPI_SYSTEM extraction
 │   │   └── triage.c           # Masterkey/credential/vault file triage
 │   │
-│   └── bofs/                  # Individual BOF entry points (20 total)
+│   └── bofs/                  # Individual BOF entry points (21 total)
 │       ├── backupkey.c
 │       ├── blob.c
 │       ├── certificates.c
@@ -641,6 +654,7 @@ DPAPI_BOF/
 │       ├── rdg.c
 │       ├── sccm.c
 │       ├── sccm_disk.c
+│       ├── sccm_recon.c
 │       ├── search.c
 │       ├── triage_bof.c
 │       └── vaults.c
